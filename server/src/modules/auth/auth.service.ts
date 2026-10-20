@@ -1,0 +1,595 @@
+import crypto from 'node:crypto';
+import { signAccessToken, generateRefreshToken, getRefreshTokenExpiresAt } from '@libs/auth.js';
+import { hashPassword, verifyPassword } from '@libs/password.js';
+import { getRedis } from '@libs/redis.js';
+import { sendEmail } from '@libs/email.js';
+import { logger } from '@libs/logger.js';
+import { env } from '@config/env.js';
+import { assertAccountCanSignIn } from '@libs/account-status.js';
+import {
+  ConflictError,
+  UnauthorizedError,
+  NotFoundError,
+  BadRequestError,
+  TooManyRequestsError,
+  describeWait,
+} from '@shared/errors/errors.js';
+import { consumeEmailQuota } from '@libs/email-quota.js';
+import { assertRedisReady } from '@libs/redis-required.js';
+import { hashToken } from '@libs/token-hash.js';
+import type { UserRole } from '@shared/types/index.js';
+import * as authRepo from './auth.repo.js';
+import { sessionRepository } from './session.repo.js';
+import type { RegisterInput, LoginInput } from './auth.schemas.js';
+import { sendVerification } from "./verification.service.js";
+
+/** A refresh that lost a race with a parallel one (see refresh()); its cookies must stay. */
+export const REFRESH_TOKEN_ROTATED = 'REFRESH_TOKEN_ROTATED';
+
+// "Just rotated" notes: `rt-rotated:<sha256 of the old refresh token>`, kept
+// for a minute. A parallel refresh that arrives a few ms after the winner
+// finds its token already gone; the note tells it apart from a stale or
+// stolen token, so it gets REFRESH_TOKEN_ROTATED (cookies kept) instead of
+// INVALID_REFRESH_TOKEN (cookies cleared, signing that browser out).
+const ROTATED_NOTE_PREFIX = 'rt-rotated:';
+const ROTATED_NOTE_SECONDS = 60;
+
+async function noteRotation(refreshToken: string): Promise<void> {
+  try {
+    await getRedis().set(`${ROTATED_NOTE_PREFIX}${hashToken(refreshToken)}`, '1', 'EX', ROTATED_NOTE_SECONDS);
+  } catch {
+    // Redis down: a late parallel refresh then falls back to INVALID_REFRESH_TOKEN
+  }
+}
+
+async function wasJustRotated(refreshToken: string): Promise<boolean> {
+  try {
+    return (await getRedis().exists(`${ROTATED_NOTE_PREFIX}${hashToken(refreshToken)}`)) === 1;
+  } catch {
+    return false;
+  }
+}
+
+const PASSWORD_RESET_TTL = 3600; // 1 hour in seconds
+// Reset tokens in Redis are stored by fingerprint only (libs/token-hash.ts):
+// `pw-reset:<sha256>` -> userId, and `pw-reset-user:<userId>` -> that sha256
+// (to invalidate a user's previous link). The raw token exists only in the email.
+const PASSWORD_RESET_PREFIX = 'pw-reset:';
+const PASSWORD_RESET_USER_PREFIX = 'pw-reset-user:';
+
+// --- Account lockout (scoped to email + IP) ---
+// Failed-login attempts are tracked in Redis keyed by the (email, IP) PAIR.
+// Keying by email alone let anyone lock a victim out remotely by spamming bad
+// passwords at the victim's email (lockout DoS). Scoped to email+IP, an
+// attacker only ever locks out their own address; distributed attempts are
+// still throttled by the per-IP rate limit on the login route.
+// Unknown emails are counted and locked exactly like real ones, so a locked
+// answer (429 LOGIN_LOCKED with the wait time) never reveals that an account
+// exists. Redis failures fail OPEN (no lockout) — consistent with ip-block.ts:
+// availability over lockout, and rate limiting still applies.
+const LOGIN_FAIL_PREFIX = 'login-fail:';
+const LOGIN_LOCK_PREFIX = 'login-lock:';
+// The failure count is forgotten an hour after the LAST failure (refreshed on each one).
+const LOGIN_FAIL_WINDOW_SECONDS = 60 * 60;
+
+// Lock ladder: the 15th failure locks for 15 minutes; the 30th (and every 15th
+// after it) locks for 1 hour. Failures between those steps do not re-lock, so a
+// user whose 15-minute lock ended gets another 14 tries before the long lock.
+export const FIRST_LOCK_AT = 15;
+const FIRST_LOCK_SECONDS = 15 * 60;
+const LONG_LOCK_SECONDS = 60 * 60;
+
+/** Lock length (seconds) that this failure count starts, or null for none. */
+export function lockSecondsForFailure(failedAttempts: number): number | null {
+  if (failedAttempts === FIRST_LOCK_AT) return FIRST_LOCK_SECONDS;
+  if (failedAttempts >= FIRST_LOCK_AT * 2 && failedAttempts % FIRST_LOCK_AT === 0) return LONG_LOCK_SECONDS;
+  return null;
+}
+
+function lockoutKey(prefix: string, email: string, ipAddress?: string): string {
+  return `${prefix}${email.toLowerCase()}:${ipAddress ?? 'unknown'}`;
+}
+
+function loginLockedError(seconds: number): TooManyRequestsError {
+  return new TooManyRequestsError(
+    `Too many failed sign-in attempts. Try again in ${describeWait(seconds)}.`,
+    'LOGIN_LOCKED',
+    seconds,
+  );
+}
+
+/** Seconds left on this email+IP lock, or 0 when not locked (also on Redis failure). */
+async function loginLockSeconds(email: string, ipAddress?: string): Promise<number> {
+  try {
+    const ttl = await getRedis().ttl(lockoutKey(LOGIN_LOCK_PREFIX, email, ipAddress));
+    return ttl > 0 ? ttl : 0;
+  } catch {
+    return 0; // fail open — Redis down must not block all logins
+  }
+}
+
+/** Count one failure; returns the lock length (seconds) it started, or 0. */
+async function recordFailedLogin(email: string, ipAddress?: string): Promise<number> {
+  try {
+    const redis = getRedis();
+    const failKey = lockoutKey(LOGIN_FAIL_PREFIX, email, ipAddress);
+
+    const attempts = await redis.incr(failKey);
+    await redis.expire(failKey, LOGIN_FAIL_WINDOW_SECONDS);
+
+    const lockSeconds = lockSecondsForFailure(attempts);
+    if (lockSeconds) {
+      await redis.set(lockoutKey(LOGIN_LOCK_PREFIX, email, ipAddress), '1', 'EX', lockSeconds);
+      return lockSeconds;
+    }
+    return 0;
+  } catch {
+    // Non-critical: don't break the login error path if tracking fails
+    logger.warn('[AUTH] Failed to record failed login attempt');
+    return 0;
+  }
+}
+
+// Hash checked for unknown emails, so they take as long as a wrong password on a real
+// account (no timing hint about which emails are registered). Computed once, on first use.
+// A failed computation is not cached: otherwise every later unknown-email login would
+// answer 500 while real accounts answer 401, revealing which emails are registered.
+let dummyPasswordHash: Promise<string> | undefined;
+function getDummyPasswordHash(): Promise<string> {
+  dummyPasswordHash ??= hashPassword(crypto.randomBytes(32).toString('hex')).catch((error: unknown) => {
+    dummyPasswordHash = undefined;
+    throw error;
+  });
+  return dummyPasswordHash;
+}
+
+async function clearFailedLogins(email: string, ipAddress?: string): Promise<void> {
+  try {
+    await getRedis().del(
+      lockoutKey(LOGIN_FAIL_PREFIX, email, ipAddress),
+      lockoutKey(LOGIN_LOCK_PREFIX, email, ipAddress),
+    );
+  } catch {
+    // Non-critical: keys expire on their own
+  }
+}
+
+export interface SanitizedUser {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  avatarUrl: string | null;
+  role: UserRole;
+  isActive: boolean;
+  /** ISO timestamp of email verification, or null while unverified. */
+  emailVerifiedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthResult {
+  user: SanitizedUser;
+  accessToken: string;
+  refreshToken: string;
+}
+
+interface RegisterResult {
+  user: SanitizedUser;
+  accessToken?: string;
+  refreshToken?: string;
+  requiresVerification: boolean;
+}
+
+export function sanitizeUser(user: {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  avatarUrl?: string | null;
+  role: UserRole;
+  isActive: boolean;
+  emailVerifiedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}): SanitizedUser {
+  return {
+    id: user.id,
+    email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    avatarUrl: user.avatarUrl ?? null,
+    role: user.role,
+    isActive: user.isActive,
+    emailVerifiedAt: user.emailVerifiedAt ? user.emailVerifiedAt.toISOString() : null,
+    createdAt: user.createdAt.toISOString(),
+    updatedAt: user.updatedAt.toISOString(),
+  };
+}
+
+export async function register(
+  input: RegisterInput,
+  deviceInfo?: string,
+  ipAddress?: string,
+): Promise<RegisterResult> {
+  const existingUser = await authRepo.findUserByEmail(input.email);
+  if (existingUser) {
+    throw new ConflictError('Email already registered', 'EMAIL_ALREADY_EXISTS');
+  }
+
+  // Keep the email reserved while the soft-deleted account is retained.
+  const deletedUser = await authRepo.findDeletedUserByEmail(input.email);
+  if (deletedUser) {
+    throw new ConflictError(
+      'An account with this email was recently deleted and cannot be registered yet.',
+      'EMAIL_ALREADY_EXISTS',
+    );
+  }
+
+  const hashedPassword = await hashPassword(input.password);
+  // A new account is never banned (isActive stays at its default true). When
+  // verification is required it starts unverified and gets no session until it
+  // proves its email; otherwise it counts as verified from the start.
+  const requiresVerification = env.REQUIRE_USER_VERIFICATION;
+
+  const user = await authRepo.createUser({
+    email: input.email,
+    password: hashedPassword,
+    firstName: input.firstName,
+    lastName: input.lastName,
+    emailVerifiedAt: requiresVerification ? null : new Date(),
+  });
+
+  // If verification is required, don't issue tokens — user must verify first
+  if (requiresVerification) {
+    // Auto-send verification email on registration (best-effort, don't block registration).
+    // Not charged to the per-address email cap: an address registers only once, so this
+    // email cannot flood anyone, and strangers using up the cap must not stop it.
+    sendVerification(input.email, { quota: 'none' }).catch((error) => logger.warn({ code: error?.code }, '[AUTH] Verification email not sent at register'));
+
+    return {
+      user: sanitizeUser(user),
+      requiresVerification: true,
+    };
+  }
+
+  // Session first: the access token carries its id (see authenticate()).
+  const refreshToken = generateRefreshToken();
+  const refreshTokenExpiresAt = getRefreshTokenExpiresAt();
+
+  const session = await sessionRepository.createSession({
+    userId: user.id,
+    deviceInfo,
+    ipAddress,
+    expiresAt: refreshTokenExpiresAt,
+  });
+
+  const accessToken = signAccessToken({
+    userId: user.id,
+    role: user.role,
+    sessionId: session.id,
+  });
+
+  await authRepo.createRefreshToken({
+    token: refreshToken,
+    userId: user.id,
+    sessionId: session.id,
+    expiresAt: refreshTokenExpiresAt,
+  });
+
+  return {
+    user: sanitizeUser(user),
+    accessToken,
+    refreshToken,
+    requiresVerification: false,
+  };
+}
+
+export async function login(
+  input: LoginInput,
+  deviceInfo?: string,
+  ipAddress?: string,
+): Promise<AuthResult> {
+  // Check the lock FIRST, for any email (registered or not), so a locked
+  // answer looks the same whether or not the account exists. Scoped to this
+  // email+IP pair, so an attacker spamming bad passwords only locks out their
+  // OWN address and cannot remotely lock the real user out (lockout DoS).
+  const lockedFor = await loginLockSeconds(input.email, ipAddress);
+  if (lockedFor > 0) {
+    throw loginLockedError(lockedFor);
+  }
+
+  const user = await authRepo.findUserByEmail(input.email);
+  // Unknown email: same password-check cost and same failure counting as a
+  // wrong password, so neither timing nor the lock reveals registered emails.
+  const valid = user
+    ? await verifyPassword(input.password, user.password)
+    : (await verifyPassword(input.password, await getDummyPasswordHash()), false);
+
+  if (!user || !valid) {
+    const lockStarted = await recordFailedLogin(input.email, ipAddress);
+    if (lockStarted > 0) {
+      throw loginLockedError(lockStarted); // tell the user now, not on the next try
+    }
+    throw new UnauthorizedError('Invalid email or password', 'INVALID_CREDENTIALS');
+  }
+
+  // Successful login — clear the email+IP failure counter.
+  await clearFailedLogins(input.email, ipAddress);
+
+  // Reveal account state only now that the password is proven, so an anonymous
+  // caller cannot learn whether an email is banned or unverified.
+  // Email-verification module: re-send a fresh link to an unverified (not banned) account.
+  // Own 'sign-in' email counter: only the password holder gets here, so strangers who use up
+  // the public counter (forgot-password, resend) can never block this link.
+  if (user.isActive && env.REQUIRE_USER_VERIFICATION && !user.emailVerifiedAt) {
+    sendVerification(user.email, { quota: 'sign-in' }).catch((error) => logger.warn({ code: error?.code }, '[AUTH] Verification email not re-sent at sign-in'));
+  }
+  assertAccountCanSignIn(user);
+
+  // Session first: the access token carries its id (see authenticate()).
+  const refreshToken = generateRefreshToken();
+  const refreshTokenExpiresAt = getRefreshTokenExpiresAt();
+
+  const session = await sessionRepository.createSession({
+    userId: user.id,
+    deviceInfo,
+    ipAddress,
+    expiresAt: refreshTokenExpiresAt,
+  });
+
+  const accessToken = signAccessToken({
+    userId: user.id,
+    role: user.role,
+    sessionId: session.id,
+  });
+
+  await authRepo.createRefreshToken({
+    token: refreshToken,
+    userId: user.id,
+    sessionId: session.id,
+    expiresAt: refreshTokenExpiresAt,
+  });
+
+  return {
+    user: sanitizeUser(user),
+    accessToken,
+    refreshToken,
+  };
+}
+
+export async function refresh(refreshToken: string): Promise<{ accessToken: string; refreshToken: string }> {
+  const storedToken = await authRepo.findRefreshToken(refreshToken);
+  if (!storedToken) {
+    // Gone a moment ago because a parallel refresh rotated it: lost race, not a bad token.
+    if (await wasJustRotated(refreshToken)) {
+      throw new UnauthorizedError('Refresh token already used by a parallel request', REFRESH_TOKEN_ROTATED);
+    }
+    throw new UnauthorizedError('Invalid refresh token', 'INVALID_REFRESH_TOKEN');
+  }
+
+  if (new Date() > storedToken.expiresAt) {
+    await authRepo.deleteRefreshToken(refreshToken);
+    throw new UnauthorizedError('Refresh token expired', 'REFRESH_TOKEN_EXPIRED');
+  }
+
+  // A token is only as alive as its session. If the session row is gone
+  // (logout elsewhere, admin force-expire, cleanup job) or past its expiry, the
+  // login is over: drop the token instead of minting new ones.
+  const session = storedToken.sessionId
+    ? await sessionRepository.getSessionById(storedToken.sessionId)
+    : null;
+  if (!session || session.expiresAt <= new Date()) {
+    await authRepo.deleteRefreshToken(refreshToken);
+    throw new UnauthorizedError('Session expired', 'SESSION_EXPIRED');
+  }
+
+  const user = await authRepo.findUserById(storedToken.userId);
+  if (!user) {
+    throw new UnauthorizedError('User not found or disabled', 'INVALID_REFRESH_TOKEN');
+  }
+  // A ban (or a pending verification) also stops refresh, so a banned user's
+  // leftover refresh token cannot mint new access tokens.
+  assertAccountCanSignIn(user);
+
+  const newAccessToken = signAccessToken({
+    userId: user.id,
+    role: user.role,
+    sessionId: session.id,
+  });
+  const newRefreshToken = generateRefreshToken();
+
+  // Note the rotation BEFORE doing it, so a parallel refresh that finds the
+  // token already gone (it arrived just after this one won) is recognised as a
+  // lost race. Harmless if this rotation then fails: the note only matters to
+  // requests whose token no longer exists.
+  await noteRotation(refreshToken);
+
+  // Single-winner rotation (see rotateRefreshToken): false when a parallel
+  // request rotated this token first.
+  const rotated = await authRepo.rotateRefreshToken(refreshToken, {
+    token: newRefreshToken,
+    userId: user.id,
+    sessionId: session.id,
+    expiresAt: getRefreshTokenExpiresAt(),
+  });
+
+  if (!rotated) {
+    // A parallel request rotated this token first. That is normally two tabs
+    // of the same browser refreshing at once (they share the cookie and the
+    // 15-minute access token, so both refresh when it expires). The winner's
+    // response has already set the new cookies, so refuse ONLY this request,
+    // with a code the controller recognises so it does NOT clear those cookies.
+    // Nothing is revoked: wiping every session here used to sign the user out
+    // on all devices for a harmless race, while a real replay of a stolen old
+    // token arrives later and is rejected above as not found.
+    logger.info({ userId: user.id }, '[AUTH] Parallel refresh lost the race; refusing only this request');
+    throw new UnauthorizedError('Refresh token already used by a parallel request', REFRESH_TOKEN_ROTATED);
+  }
+
+  return {
+    accessToken: newAccessToken,
+    refreshToken: newRefreshToken,
+  };
+}
+
+export async function logout(refreshToken: string): Promise<void> {
+  // Find the token before deleting so we can delete the linked session.
+  // Both deleteRefreshToken and deleteSession handle "already deleted" (P2025)
+  // gracefully, so no catch needed for concurrent request / cleanup job races.
+  const storedToken = await authRepo.findRefreshToken(refreshToken);
+  await authRepo.deleteRefreshToken(refreshToken);
+
+  if (storedToken?.sessionId) {
+    await sessionRepository.deleteSession(storedToken.sessionId);
+  }
+}
+
+export async function getCurrentUser(userId: string): Promise<SanitizedUser> {
+  const user = await authRepo.findUserById(userId);
+  if (!user) {
+    throw new NotFoundError('User not found', 'USER_NOT_FOUND');
+  }
+
+  return sanitizeUser(user);
+}
+
+interface SessionInfo {
+  id: string;
+  deviceInfo: string | null;
+  ipAddress: string | null;
+  lastActiveAt: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export async function getUserSessions(userId: string): Promise<SessionInfo[]> {
+  const sessions = await sessionRepository.getUserSessions(userId);
+  return sessions.map((session) => ({
+    id: session.id,
+    deviceInfo: session.deviceInfo,
+    ipAddress: session.ipAddress,
+    lastActiveAt: session.lastActiveAt.toISOString(),
+    expiresAt: session.expiresAt.toISOString(),
+    createdAt: session.createdAt.toISOString(),
+  }));
+}
+
+export async function logoutAllSessions(userId: string): Promise<number> {
+  const sessionCount = await sessionRepository.deleteAllUserSessions(userId);
+  await authRepo.deleteRefreshTokensByUserId(userId);
+  return sessionCount;
+}
+
+export async function forgotPassword(email: string): Promise<void> {
+  // Reset tokens live in Redis: without it, answer a clear 503 for every
+  // address (checked before the lookup, so it reveals nothing).
+  assertRedisReady('Password reset');
+
+  // Per-address email cap, counted BEFORE the lookup so unknown addresses are
+  // counted too (the 429 reveals nothing about the account). See libs/email-quota.ts.
+  await consumeEmailQuota(email);
+
+  const user = await authRepo.findUserByEmail(email);
+
+  // Silent return if user not found — prevents email enumeration
+  if (!user) return;
+
+  const redis = getRedis();
+
+  // Invalidate any existing token for this user (the pointer holds its fingerprint)
+  const existingTokenHash = await redis.get(`${PASSWORD_RESET_USER_PREFIX}${user.id}`);
+  if (existingTokenHash) {
+    await redis.del(`${PASSWORD_RESET_PREFIX}${existingTokenHash}`);
+    await redis.del(`${PASSWORD_RESET_USER_PREFIX}${user.id}`);
+  }
+
+  // Generate a secure token; only its fingerprint goes to Redis (1 hour TTL)
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashToken(token);
+
+  await redis.set(`${PASSWORD_RESET_PREFIX}${tokenHash}`, user.id, 'EX', PASSWORD_RESET_TTL);
+  await redis.set(`${PASSWORD_RESET_USER_PREFIX}${user.id}`, tokenHash, 'EX', PASSWORD_RESET_TTL);
+
+  // Build reset URL and send email
+  const resetUrl = `${env.CLIENT_URL}/reset-password?token=${token}`;
+  const safeName = user.firstName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: 'Reset your password',
+      html: `
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f3ee; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+          <tr>
+            <td align="center">
+              <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 480px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border-left: 4px solid #c15f3c;">
+                <tr>
+                  <td style="padding: 40px;">
+                    <p style="margin: 0 0 20px; font-size: 12px; font-weight: 600; color: #c15f3c; text-transform: uppercase; letter-spacing: 1.5px;">Password Reset</p>
+                    <h1 style="margin: 0 0 8px; font-size: 22px; font-weight: 600; color: #1a170f;">Choose a new password</h1>
+                    <p style="margin: 0 0 28px; font-size: 15px; color: #6b6560; line-height: 1.6;">
+                      Hi ${safeName}, we received a request to reset your password. Click the button below to continue.
+                    </p>
+                    <a href="${resetUrl}" style="display: inline-block; background-color: #1a170f; color: #ffffff; padding: 14px 32px; border-radius: 10px; text-decoration: none; font-size: 15px; font-weight: 600;">
+                      Reset password &rarr;
+                    </a>
+                    <p style="margin: 28px 0 0; font-size: 13px; color: #9b958e; line-height: 1.6;">
+                      This link expires in 1 hour. If you didn't request this, you can safely ignore this email.
+                    </p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 0 40px 32px;">
+                    <div style="border-top: 1px solid #e8e6e1; padding-top: 20px;">
+                      <p style="margin: 0; font-size: 12px; color: #b5b0a8; line-height: 1.5;">
+                        If the button doesn't work, copy this link:<br/>
+                        <a href="${resetUrl}" style="color: #c15f3c; text-decoration: underline; word-break: break-all;">${resetUrl}</a>
+                      </p>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      `,
+    });
+
+    logger.info({ userId: user.id }, '[AUTH] Password reset email sent');
+  } catch (error) {
+    // Log but don't throw — prevents leaking email existence via 500 vs 200
+    logger.error({ userId: user.id, err: error }, '[AUTH] Failed to send password reset email');
+  }
+}
+
+export async function resetPassword(token: string, newPassword: string): Promise<void> {
+  assertRedisReady('Password reset'); // the token is stored in Redis
+  const redis = getRedis();
+
+  // GETDEL reads and removes the token in one step, so a link used twice at
+  // the same instant changes the password only once: the second request finds
+  // nothing. (A separate GET then DEL let both requests through.) Consumed
+  // before the work below, so a failure after this point means a new link.
+  const userId = await redis.getdel(`${PASSWORD_RESET_PREFIX}${hashToken(token)}`);
+  if (!userId) {
+    throw new BadRequestError('Invalid or expired reset token', 'INVALID_RESET_TOKEN');
+  }
+
+  const user = await authRepo.findUserById(userId);
+  if (!user) {
+    throw new NotFoundError('User not found', 'USER_NOT_FOUND');
+  }
+
+  const hashedPassword = await hashPassword(newPassword);
+  await authRepo.updateUserPassword(userId, hashedPassword);
+
+  // The per-user pointer to the (now consumed) token
+  await redis.del(`${PASSWORD_RESET_USER_PREFIX}${userId}`);
+
+  // Invalidate all sessions for security (force re-login with new password)
+  await sessionRepository.deleteAllUserSessions(userId);
+  await authRepo.deleteRefreshTokensByUserId(userId);
+
+  logger.info({ userId }, '[AUTH] Password reset completed');
+}

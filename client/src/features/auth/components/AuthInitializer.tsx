@@ -1,0 +1,73 @@
+'use client';
+
+import type React from 'react';
+import { useEffect } from 'react';
+
+import { usePathname } from 'next/navigation';
+
+import { toast } from 'sonner';
+
+import { useAppSelector } from '@/store/hooks';
+import { useAppRouter } from '@/hooks/useAppRouter';
+import { ROUTES } from '@/lib/constants/routes';
+import { isErrorCode, isLimitError, ERROR_CODES } from '@/lib/utils/error';
+import { useCurrentUser } from '../hooks/useCurrentUser';
+
+const PROTECTED_PATHS: string[] = [ROUTES.DASHBOARD, ROUTES.PROFILE, '/admin'];
+
+// Auth pages where getMe() should never fire — there is no session to hydrate
+// on login/register/reset-password, and calling getMe() here would trigger the
+// 401 → refresh → fail → redirect chain for no reason.
+const AUTH_PATHS: string[] = [ROUTES.LOGIN, ROUTES.REGISTER, ROUTES.RESET_PASSWORD, ROUTES.VERIFY_ACCOUNT];
+
+interface AuthInitializerProps {
+  children: React.ReactNode;
+}
+
+function isProtectedPath(pathname: string): boolean {
+  return PROTECTED_PATHS.some((path) => pathname.startsWith(path));
+}
+
+function isAuthPage(pathname: string): boolean {
+  return AUTH_PATHS.some((path) => pathname.startsWith(path));
+}
+
+interface HttpLikeError {
+  response?: { status?: number };
+}
+
+export const AuthInitializer = ({ children }: AuthInitializerProps): React.ReactElement => {
+  const pathname = usePathname();
+  const router = useAppRouter();
+  const { isLoggingOut } = useAppSelector((state) => state.auth);
+
+  // Skip getMe() on auth pages and during logout.
+  // React Query handles deduping, refetch-on-focus, and invalidation —
+  // any mutation that touches the current user (profile update, role change,
+  // avatar upload, email verification) should call:
+  //   queryClient.invalidateQueries({ queryKey: authKeys.me() })
+  // to refresh Redux state automatically.
+  const enabled = !isAuthPage(pathname) && !isLoggingOut;
+
+  const { error } = useCurrentUser({ enabled });
+
+  useEffect(() => {
+    if (!error) return;
+    if (!isProtectedPath(pathname)) return;
+    // Rate limited or network blocked: the session may be fine, so stay put. The
+    // global toast already says how long to wait (lib/api/axios.config.ts).
+    if (isLimitError(error)) return;
+
+    const status = (error as HttpLikeError)?.response?.status;
+    if (status === 401 || status === 403) {
+      if (isErrorCode(error, ERROR_CODES.ACCOUNT_DEACTIVATED)) {
+        toast.error('This account has been deactivated. Contact support if you think this is a mistake.');
+      } else if (isErrorCode(error, ERROR_CODES.EMAIL_NOT_VERIFIED)) {
+        toast.error('Please verify your email address before signing in.');
+      }
+      router.push(ROUTES.LOGIN);
+    }
+  }, [error, pathname, router]);
+
+  return <>{children}</>;
+};

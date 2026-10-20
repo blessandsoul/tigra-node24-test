@@ -1,0 +1,115 @@
+import { prisma, isPrismaNotFound } from '@libs/prisma.js';
+import type { Session } from '@prisma/client';
+
+export class SessionRepository {
+  /**
+   * Create a new session
+   */
+  async createSession(data: {
+    userId: string;
+    deviceInfo?: string;
+    ipAddress?: string;
+    expiresAt: Date;
+  }): Promise<Session> {
+    return prisma.session.create({
+      data: {
+        userId: data.userId,
+        deviceInfo: data.deviceInfo,
+        ipAddress: data.ipAddress,
+        expiresAt: data.expiresAt,
+      },
+    });
+  }
+
+  /**
+   * Get all active sessions for a user
+   */
+  async getUserSessions(userId: string): Promise<Session[]> {
+    return prisma.session.findMany({
+      where: {
+        userId,
+        expiresAt: {
+          gt: new Date(),
+        },
+      },
+      orderBy: {
+        lastActiveAt: 'desc',
+      },
+    });
+  }
+
+  /**
+   * Delete a specific session (no-op if already deleted)
+   */
+  async deleteSession(sessionId: string): Promise<void> {
+    try {
+      await prisma.session.delete({
+        where: { id: sessionId },
+      });
+    } catch (error) {
+      if (isPrismaNotFound(error)) return;
+      throw error;
+    }
+  }
+
+  /**
+   * Delete all sessions for a user
+   */
+  async deleteAllUserSessions(userId: string): Promise<number> {
+    const result = await prisma.session.deleteMany({
+      where: { userId },
+    });
+    return result.count;
+  }
+
+  /**
+   * Delete every session of a user EXCEPT one (the device that asked). Used by
+   * an owner's password change: other devices are signed out, this one stays.
+   * Their refresh tokens go with them (onDelete: Cascade on RefreshToken.session).
+   */
+  async deleteOtherUserSessions(userId: string, keepSessionId: string): Promise<number> {
+    const result = await prisma.session.deleteMany({
+      where: { userId, id: { not: keepSessionId } },
+    });
+    return result.count;
+  }
+
+  /**
+   * Delete expired sessions (for cleanup cron job)
+   */
+  async deleteExpiredSessions(): Promise<number> {
+    const result = await prisma.session.deleteMany({
+      where: {
+        expiresAt: {
+          lt: new Date(),
+        },
+      },
+    });
+    return result.count;
+  }
+
+  /**
+   * Get session by ID
+   */
+  async getSessionById(sessionId: string): Promise<Session | null> {
+    return prisma.session.findUnique({
+      where: { id: sessionId },
+    });
+  }
+
+  /**
+   * Count active sessions for a user
+   */
+  async countUserSessions(userId: string): Promise<number> {
+    return prisma.session.count({
+      where: {
+        userId,
+        expiresAt: {
+          gt: new Date(),
+        },
+      },
+    });
+  }
+}
+
+export const sessionRepository = new SessionRepository();

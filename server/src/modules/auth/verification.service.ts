@@ -1,0 +1,250 @@
+import crypto from 'node:crypto';
+import { signAccessToken, generateRefreshToken, getRefreshTokenExpiresAt } from '@libs/auth.js';
+import { getRedis } from '@libs/redis.js';
+import { sendEmail } from '@libs/email.js';
+import { logger } from '@libs/logger.js';
+import { env } from '@config/env.js';
+import { ACCOUNT_DEACTIVATED } from '@libs/account-status.js';
+import { consumeEmailQuota, type EmailQuotaBucket } from '@libs/email-quota.js';
+import { assertRedisReady } from '@libs/redis-required.js';
+import { hashToken } from '@libs/token-hash.js';
+import {
+  BadRequestError,
+  ForbiddenError,
+  NotFoundError,
+} from '@shared/errors/errors.js';
+import * as authRepo from './auth.repo.js';
+import { sessionRepository } from './session.repo.js';
+import { sanitizeUser } from './auth.service.js';
+
+import type { AuthResult } from './auth.service.js';
+
+const VERIFICATION_TTL = 3600; // 1 hour in seconds
+// Stored by fingerprint only (libs/token-hash.ts): `verify:<sha256>` -> userId,
+// `verify-user:<userId>` -> that sha256. The raw token exists only in the email.
+const VERIFICATION_PREFIX = 'verify:';
+const VERIFICATION_USER_PREFIX = 'verify-user:';
+
+/**
+ * Send a verification email to a user.
+ * Public endpoint — accepts email, silent return if user not found (prevents enumeration).
+ * Also called internally by the register and login flows for auto-sending.
+ *
+ * Verification proves email ownership and nothing else: it sets
+ * `emailVerifiedAt` and never touches `isActive` (the admin ban switch).
+ */
+export async function sendVerification(
+  email: string,
+  { quota = 'public' }: { quota?: EmailQuotaBucket | 'none' } = {},
+): Promise<void> {
+  // Per-address email cap (libs/email-quota.ts), counted BEFORE the lookup so
+  // unknown, banned and already-verified addresses count the same and the 429
+  // reveals nothing. Which counter:
+  // - 'public' (default): the public resend endpoint, shared with forgot-password.
+  //   Over the cap it answers 429 EMAIL_RATE_LIMITED with the wait.
+  // - 'sign-in': the resend after a correct password; its own counter, so
+  //   strangers typing the address cannot use it up.
+  // - 'none': the one email sent at register (an address registers only once).
+  // Register and the sign-in resend call this fire-and-forget: over their cap
+  // the email is skipped and the caller logs it.
+  //
+  // Verification tokens live in Redis: without it, answer a clear 503 for every
+  // address (checked first, so it reveals nothing about the account).
+  assertRedisReady('Email verification');
+  if (quota !== 'none') {
+    await consumeEmailQuota(email, quota);
+  }
+
+  const user = await authRepo.findUserByEmail(email);
+
+  // Silent return if user not found — prevents email enumeration (same pattern as forgotPassword)
+  if (!user) return;
+
+  // No token for a banned account: a verify link must never lift an admin ban
+  // (that is exactly how a banned user used to re-activate themselves). No
+  // token either when the email is already verified. Both stay silent so the
+  // response does not reveal the account's status.
+  if (!user.isActive || user.emailVerifiedAt) return;
+
+  const redis = getRedis();
+
+  // Invalidate any existing verification token for this user (the pointer holds its fingerprint)
+  const existingTokenHash = await redis.get(`${VERIFICATION_USER_PREFIX}${user.id}`);
+  if (existingTokenHash) {
+    await redis.del(`${VERIFICATION_PREFIX}${existingTokenHash}`);
+    await redis.del(`${VERIFICATION_USER_PREFIX}${user.id}`);
+  }
+
+  // Generate a secure token; only its fingerprint goes to Redis (1 hour TTL)
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashToken(token);
+
+  await redis.set(`${VERIFICATION_PREFIX}${tokenHash}`, user.id, 'EX', VERIFICATION_TTL);
+  await redis.set(`${VERIFICATION_USER_PREFIX}${user.id}`, tokenHash, 'EX', VERIFICATION_TTL);
+
+  // Build verification URL and send email
+  const verifyUrl = `${env.CLIENT_URL}/verify-account?token=${token}`;
+  const safeName = user.firstName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: 'Verify your account',
+      html: `
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f3ee; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+          <tr>
+            <td align="center">
+              <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 480px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border-left: 4px solid #c15f3c;">
+                <tr>
+                  <td style="padding: 40px;">
+                    <p style="margin: 0 0 20px; font-size: 12px; font-weight: 600; color: #c15f3c; text-transform: uppercase; letter-spacing: 1.5px;">Account Verification</p>
+                    <h1 style="margin: 0 0 8px; font-size: 22px; font-weight: 600; color: #1a170f;">Verify your account</h1>
+                    <p style="margin: 0 0 28px; font-size: 15px; color: #6b6560; line-height: 1.6;">
+                      Hi ${safeName}, please verify your email address to activate your account and get started.
+                    </p>
+                    <a href="${verifyUrl}" style="display: inline-block; background-color: #1a170f; color: #ffffff; padding: 14px 32px; border-radius: 10px; text-decoration: none; font-size: 15px; font-weight: 600;">
+                      Verify account &rarr;
+                    </a>
+                    <p style="margin: 28px 0 0; font-size: 13px; color: #9b958e; line-height: 1.6;">
+                      This link expires in 1 hour. If you didn't create an account, you can safely ignore this email.
+                    </p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 0 40px 32px;">
+                    <div style="border-top: 1px solid #e8e6e1; padding-top: 20px;">
+                      <p style="margin: 0; font-size: 12px; color: #b5b0a8; line-height: 1.5;">
+                        If the button doesn't work, copy this link:<br/>
+                        <a href="${verifyUrl}" style="color: #c15f3c; text-decoration: underline; word-break: break-all;">${verifyUrl}</a>
+                      </p>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      `,
+    });
+
+    logger.info({ userId: user.id }, '[AUTH] Verification email sent');
+  } catch (error) {
+    // Log but don't throw — prevents leaking email existence via 500 vs 200
+    logger.error({ userId: user.id, err: error }, '[AUTH] Failed to send verification email');
+  }
+}
+
+export async function verifyAccount(
+  token: string,
+  deviceInfo?: string,
+  ipAddress?: string,
+): Promise<AuthResult> {
+  assertRedisReady('Email verification'); // the token is stored in Redis
+  const redis = getRedis();
+
+  // Atomic get-and-delete to prevent token reuse via concurrent requests
+  // ioredis exposes GETDEL as getdel (all lowercase); getDel does not exist.
+  const userId = await redis.getdel(`${VERIFICATION_PREFIX}${hashToken(token)}`);
+  if (!userId) {
+    throw new BadRequestError('Invalid or expired verification token', 'INVALID_VERIFICATION_TOKEN');
+  }
+
+  const user = await authRepo.findUserById(userId);
+  if (!user) {
+    throw new NotFoundError('User not found', 'USER_NOT_FOUND');
+  }
+
+  // Clean up the reverse-lookup key (the token itself was consumed above)
+  await redis.del(`${VERIFICATION_USER_PREFIX}${userId}`);
+
+  // A token issued before a ban must not lift the ban or open a session.
+  if (!user.isActive) {
+    throw new ForbiddenError(
+      'This account has been deactivated. Contact support if you think this is a mistake.',
+      ACCOUNT_DEACTIVATED,
+    );
+  }
+
+  // Conditional write: only an active, not-yet-verified account is marked. If a
+  // ban lands between the read above and this write, the ban wins.
+  const verifiedAt = new Date();
+  const marked = await authRepo.markEmailVerified(userId, verifiedAt);
+  if (!marked) {
+    const current = await authRepo.findUserById(userId);
+    if (!current || !current.isActive) {
+      throw new ForbiddenError(
+        'This account has been deactivated. Contact support if you think this is a mistake.',
+        ACCOUNT_DEACTIVATED,
+      );
+    }
+    throw new BadRequestError('This email address is already verified', 'ALREADY_VERIFIED');
+  }
+
+  // Generate tokens and create session (same pattern as login)
+  // Session first: the access token carries its id (see authenticate()).
+  const refreshToken = generateRefreshToken();
+  const refreshTokenExpiresAt = getRefreshTokenExpiresAt();
+
+  const session = await sessionRepository.createSession({
+    userId: user.id,
+    deviceInfo,
+    ipAddress,
+    expiresAt: refreshTokenExpiresAt,
+  });
+
+  const accessToken = signAccessToken({
+    userId: user.id,
+    role: user.role,
+    sessionId: session.id,
+  });
+
+  await authRepo.createRefreshToken({
+    token: refreshToken,
+    userId: user.id,
+    sessionId: session.id,
+    expiresAt: refreshTokenExpiresAt,
+  });
+
+  logger.info({ userId }, '[AUTH] Account verified');
+
+  // Send welcome email (best-effort — don't fail verification if email fails)
+  const safeName = user.firstName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const dashboardUrl = `${env.CLIENT_URL}/dashboard`;
+
+  try {
+    await sendEmail({
+      to: user.email,
+      subject: 'Welcome — your account is verified!',
+      html: `
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f3ee; padding: 40px 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+          <tr>
+            <td align="center">
+              <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 480px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border-left: 4px solid #c15f3c;">
+                <tr>
+                  <td style="padding: 40px;">
+                    <p style="margin: 0 0 20px; font-size: 12px; font-weight: 600; color: #c15f3c; text-transform: uppercase; letter-spacing: 1.5px;">Welcome</p>
+                    <h1 style="margin: 0 0 8px; font-size: 22px; font-weight: 600; color: #1a170f;">You're all set!</h1>
+                    <p style="margin: 0 0 28px; font-size: 15px; color: #6b6560; line-height: 1.6;">
+                      Hi ${safeName}, your account has been verified. You can now access all features of the app.
+                    </p>
+                    <a href="${dashboardUrl}" style="display: inline-block; background-color: #1a170f; color: #ffffff; padding: 14px 32px; border-radius: 10px; text-decoration: none; font-size: 15px; font-weight: 600;">
+                      Go to dashboard &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      `,
+    });
+  } catch (error) {
+    logger.error({ userId, err: error }, '[AUTH] Failed to send welcome email');
+  }
+
+  return {
+    user: sanitizeUser({ ...user, emailVerifiedAt: verifiedAt }),
+    accessToken,
+    refreshToken,
+  };
+}

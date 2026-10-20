@@ -1,0 +1,74 @@
+import { z } from 'zod';
+
+// ─── IP Blocking ────────────────────────────────────────────────────────────
+
+// Any spelling of an IPv4 or IPv6 address is accepted; libs/ip-block.ts stores
+// and matches the canonical form (libs/ip-address.ts).
+const ipAddress = z.union([z.ipv4(), z.ipv6()], { message: 'Invalid IP address' });
+
+export const blockIpSchema = z.object({
+  ip: ipAddress,
+  reason: z.string().max(500).optional(),
+});
+
+export const unblockIpParamsSchema = z.object({
+  ip: ipAddress,
+});
+
+export type BlockIpInput = z.infer<typeof blockIpSchema>;
+export type UnblockIpParams = z.infer<typeof unblockIpParamsSchema>;
+
+// ─── User Management ────────────────────────────────────────────────────────
+
+/**
+ * A true/false query parameter. It is parsed TWICE: the route schema turns
+ * "true"/"false" into a boolean, then the controller's parseInput parses that
+ * result again (admin.controller.ts). So it must also accept the boolean, or
+ * the second parse rejects every request (that broke ?isActive= and, with a
+ * default, the whole user list).
+ */
+const booleanQuery = z.union([z.boolean(), z.enum(['true', 'false']).transform((v) => v === 'true')]);
+
+export const getUsersQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(10),
+  search: z.string().max(100).optional(),
+  role: z.enum(['USER', 'ADMIN']).optional(),
+  isActive: booleanQuery.optional(),
+  sortBy: z.enum(['createdAt', 'email', 'firstName']).default('createdAt'),
+  sortOrder: z.enum(['asc', 'desc']).default('desc'),
+  // true: ONLY soft-deleted accounts (still restorable until the purge), with purgeAt.
+  deleted: booleanQuery.default(false),
+});
+
+export const userIdParamsSchema = z.object({
+  userId: z.string().uuid('Invalid user ID'),
+});
+
+export const updateUserStatusSchema = z.object({
+  isActive: z.boolean(),
+});
+
+export const updateUserRoleSchema = z.object({
+  role: z.enum(['USER', 'ADMIN']),
+});
+
+export type GetUsersQuery = z.infer<typeof getUsersQuerySchema>;
+export type UserIdParams = z.infer<typeof userIdParamsSchema>;
+export type UpdateUserStatusInput = z.infer<typeof updateUserStatusSchema>;
+export type UpdateUserRoleInput = z.infer<typeof updateUserRoleSchema>;
+
+// ─── Session Management ─────────────────────────────────────────────────────
+
+export const getSessionsQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(10),
+  userId: z.string().uuid('Invalid user ID').optional(),
+});
+
+export const sessionIdParamsSchema = z.object({
+  sessionId: z.string().uuid('Invalid session ID'),
+});
+
+export type GetSessionsQuery = z.infer<typeof getSessionsQuerySchema>;
+export type SessionIdParams = z.infer<typeof sessionIdParamsSchema>;

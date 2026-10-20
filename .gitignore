@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.next/
+out/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Playwright MCP artifacts
+.playwright-mcp/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Uploads (local development)
+uploads/
