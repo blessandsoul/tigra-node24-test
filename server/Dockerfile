@@ -34,7 +34,7 @@
 # 0.35.5). When a sharp upgrade needs more than LIBVIPS_VERSION, bump
 # LIBVIPS_VERSION and LIBVIPS_SHA256 (from the libvips release page) in BOTH
 # Dockerfiles. Stage 2 stops the build with a clear message if you forget.
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS libvips
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS libvips
 
 ARG LIBVIPS_VERSION=8.18.7
 ARG LIBVIPS_SHA256=5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94
@@ -165,7 +165,7 @@ RUN --mount=type=cache,target=/root/.npm \
 # ===================================================================
 # Independent of stages 1-2 (tsc and prisma generate never load sharp), so
 # BuildKit runs it in parallel with the libvips compile.
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS builder
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS builder
 
 # Override NODE_ENV to ensure devDependencies are installed.
 # Coolify may inject NODE_ENV=production as a build arg, which causes npm ci
@@ -198,7 +198,7 @@ RUN npm run build
 # ===================================================================
 # Stage 4: Production Runtime
 # ===================================================================
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS production
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS production
 
 # dumb-init: proper signal handling.
 # curl: Coolify's own HTTP health check runs curl (then BusyBox wget) inside
